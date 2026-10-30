@@ -1,0 +1,12 @@
+# Local H2 database files may contain transaction data.
+/data/
+
+# Maven output and generated artifacts are shipped separately as a ZIP/release asset.
+/target/
+
+# IDE and operating-system files.
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+Thumbs.db
