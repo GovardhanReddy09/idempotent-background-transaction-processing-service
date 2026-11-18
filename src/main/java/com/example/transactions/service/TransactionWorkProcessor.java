@@ -3,7 +3,6 @@ package com.example.transactions.service;
 import com.example.transactions.model.Account;
 import com.example.transactions.model.TransactionRecord;
 import com.example.transactions.model.TransactionStatus;
-import com.example.transactions.model.TransactionType;
 import com.example.transactions.repository.AccountRepository;
 import com.example.transactions.repository.TransactionRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -22,15 +21,18 @@ public class TransactionWorkProcessor {
 
     private final TransactionRepository transactions;
     private final AccountRepository accounts;
+    private final TransactionEffectRegistry effects;
     private final int maxAttempts;
 
     public TransactionWorkProcessor(TransactionRepository transactions, AccountRepository accounts,
+            TransactionEffectRegistry effects,
             @Value("${app.worker.max-attempts:3}") int maxAttempts) {
         if (maxAttempts < 1) {
             throw new IllegalArgumentException("app.worker.max-attempts must be at least 1");
         }
         this.transactions = transactions;
         this.accounts = accounts;
+        this.effects = effects;
         this.maxAttempts = maxAttempts;
     }
 
@@ -60,8 +62,7 @@ public class TransactionWorkProcessor {
             tx.setFailureReason("Simulated transient failure");
             if (tx.getAttempts() < maxAttempts) {
                 tx.setStatus(TransactionStatus.RETRY_PENDING);
-                LOGGER.info(() -> "Retry scheduled transactionId=" + tx.getTransactionId()
-                        + " attempt=" + tx.getAttempts());
+                LOGGER.info(() -> "Retry scheduled attempt=" + tx.getAttempts());
                 return Outcome.RETRIED;
             }
             tx.setStatus(TransactionStatus.FAILED);
@@ -69,9 +70,7 @@ public class TransactionWorkProcessor {
             return Outcome.FAILED;
         }
 
-        BigDecimal newBalance = tx.getTransactionType() == TransactionType.CREDIT
-                ? account.getBalance().add(tx.getAmount())
-                : account.getBalance().subtract(tx.getAmount());
+        var newBalance = effects.forType(tx.getTransactionType()).apply(account.getBalance(), tx.getAmount());
         if (newBalance.compareTo(BigDecimal.ZERO) < 0) {
             tx.setStatus(TransactionStatus.FAILED);
             tx.setFailureReason("Insufficient funds");
@@ -83,7 +82,7 @@ public class TransactionWorkProcessor {
         account.advanceSequence();
         tx.setStatus(TransactionStatus.PROCESSED);
         tx.setFailureReason(null);
-        LOGGER.info(() -> "Transaction processed transactionId=" + tx.getTransactionId());
+        LOGGER.info("Transaction processed");
         return Outcome.PROCESSED;
     }
 
