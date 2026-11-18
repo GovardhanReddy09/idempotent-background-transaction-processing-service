@@ -24,6 +24,7 @@ public class TransactionRecord {
     @Column(length=500) private String failureReason;
     @Column(nullable=false) private Instant createdAt;
     private Instant updatedAt;
+    private Instant nextAttemptAt;
 
     protected TransactionRecord() {}
     public TransactionRecord(String transactionId, String requestId, String accountId, TransactionType type,
@@ -54,4 +55,6 @@ public class TransactionRecord {
         simulateFailureOnce = false;
     }
     public String getFailureReason(){return failureReason;} public void setFailureReason(String s){failureReason=s;}
+    public Instant getNextAttemptAt(){return nextAttemptAt;}
+    public void setNextAttemptAt(Instant nextAttemptAt){this.nextAttemptAt=nextAttemptAt;}
 }

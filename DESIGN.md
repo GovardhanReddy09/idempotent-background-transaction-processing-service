@@ -28,7 +28,7 @@ Sequence numbering starts independently at 1 for every account. Thus an isolated
 
 ## Retries and failures
 
-Each processing attempt increments `attempts`. `simulateFailureOnce` (or `simulateFailureCount`, a bounded 0-10 test hook) makes the next attempt fail deterministically. Each simulated failure sets `RETRY_PENDING` and changes neither balance nor sequence. A later worker pass may retry it. `app.worker.max-attempts` (default 3) caps attempts; a transaction still failing at the cap is marked `FAILED` and consumes its sequence. An isolated sequence-1 transaction can model a transient failure and succeed on attempt two; the count option exercises the cap. The supplied sample's sequence-5 transaction does not reach that hook until its sequence gap is filled. A real downstream integration should classify retryable versus permanent errors and use backoff.
+Each processing attempt increments `attempts`. `simulateFailureOnce` (or `simulateFailureCount`, a bounded 0-10 test hook) makes the next attempt fail deterministically. Each simulated failure sets `RETRY_PENDING` and changes neither balance nor sequence. A persisted `nextAttemptAt` timestamp delays eligibility using capped exponential backoff with jitter (`app.worker.retry.initial-delay-ms`, default 2000, and `app.worker.retry.max-delay-ms`, default 60000). Delayed records are excluded from the worker candidate query, so they do not consume the bounded batch. `app.worker.max-attempts` (default 3) caps attempts; a transaction still failing at the cap is marked `FAILED` and consumes its sequence. An isolated sequence-1 transaction can model a transient failure and succeed on a later pass; the count option exercises the cap. The supplied sample's sequence-5 transaction does not reach that hook until its sequence gap is filled.
 
 Invalid REST requests are rejected by Bean Validation before business-transaction persistence, and an error response identifies validation failure. The failed submission is retained in the audit table, does not occupy a transaction ID or account sequence, and does not prevent other valid requests from processing. Insufficient funds is a business failure recorded on its accepted transaction as `FAILED`, not an HTTP validation error.
 
@@ -40,17 +40,18 @@ Each worker tick selects at most `app.worker.batch-size` candidate IDs, ordered 
 
 ## Observability
 
-`GET /api/processing/summary` reports current transaction status counts and audited duplicate and validation-failure attempts. `uniqueTransactions` counts accepted business transaction records; `total` is unique records + duplicate attempts + invalid submission attempts, so it includes every recorded input attempt. `RECEIVED` is a current lifecycle status, not a cumulative count of records ever submitted. `GET /api/accounts` lists all created accounts with their current balances and next sequence, while `GET /api/transactions/{transactionId}` and `GET /api/accounts/{accountId}` expose individual transaction/account state. `PROCESSING` is a transient state within the atomic worker transaction. Worker logs record outcome and attempt count without transaction or account identifiers. The H2 console is disabled. This is adequate for a local assessment but is not a substitute for production metrics, structured logs, tracing, authentication, or alerts.
+All application APIs and Actuator endpoints require HTTP Basic authentication except `/actuator/health` and its probes, which reveal status only. Configure the username/password with `APP_API_USERNAME` and `APP_API_PASSWORD`; startup fails if either is missing. Passwords are BCrypt-encoded in the in-memory user store and are never committed as configuration. Basic authentication must be protected by TLS outside local development.
+
+`GET /api/processing/summary` reports current transaction status counts and audited duplicate and validation-failure attempts. `uniqueTransactions` counts accepted business transaction records; `total` is unique records + duplicate attempts + invalid submission attempts, so it includes every recorded input attempt. `RECEIVED` is a current lifecycle status, not a cumulative count of records ever submitted. `GET /api/accounts` lists all created accounts with their current balances and next sequence, while `GET /api/transactions/{transactionId}` and `GET /api/accounts/{accountId}` expose individual transaction/account state. `PROCESSING` is a transient state within the atomic worker transaction. Worker logs record outcome and attempt count without transaction or account identifiers. The H2 console is disabled. Spring Boot Actuator exposes health/readiness/liveness status and authenticated application/JVM/HTTP metrics; `/actuator/prometheus` provides a scrape endpoint. This is useful operational instrumentation but does not itself configure dashboards or alert delivery.
 
 ## Trade-offs and production hardening
 
-A scheduled database poller is simpler than introducing Kafka and meets the assessment's lightweight constraint. Its limitations are polling latency, database lock contention, and the absence of durable retry scheduling beyond status persistence. Production work should include:
+A scheduled database poller is simpler than introducing Kafka and meets the assessment's lightweight constraint. Its limitations are polling latency and database lock contention. Production work should include:
 
 - database migrations, lock-timeout policy, and load testing for multi-worker contention;
-- retry backoff with jitter, retryable/permanent error classification, and a dead-letter workflow;
+- retryable/permanent error classification and a dead-letter workflow;
 - an immutable ledger and reconciliation rather than relying only on a mutable balance;
-- authentication/authorization, rate limits, request size limits, and production-safe database configuration;
-- metrics, tracing, structured logs, operational dashboards, and alerts;
+- managed identity/secrets, TLS, fine-grained authorization, rate limits, request size limits, metrics dashboards, alerts, and tracing;
 - an outbox/inbox pattern and idempotent downstream consumers for external side effects.
 
 The H2 console and Hibernate schema auto-update are development conveniences and must be disabled/replaced for production.

@@ -20,6 +20,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -28,12 +29,18 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.httpBasic;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @SpringBootTest(properties = {
         "app.worker.fixed-delay-ms=3600000",
-        "spring.datasource.url=jdbc:h2:mem:transactions-test;DB_CLOSE_DELAY=-1"
+        "spring.datasource.url=jdbc:h2:mem:transactions-test;DB_CLOSE_DELAY=-1",
+        "app.worker.retry.initial-delay-ms=0",
+        "app.worker.retry.max-delay-ms=0",
+        "app.security.username=test-api",
+        "app.security.password=test-password"
 })
 @AutoConfigureMockMvc
 class TransactionApplicationTests {
@@ -107,17 +114,17 @@ class TransactionApplicationTests {
                 }
                 """.formatted(id, account);
 
-        mockMvc.perform(post("/api/transactions")
+        mockMvc.perform(post("/api/transactions").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(originalRequest))
                 .andExpect(status().isAccepted());
-        mockMvc.perform(post("/api/transactions")
+        mockMvc.perform(post("/api/transactions").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(conflictingRequest))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.duplicate").value(true))
                 .andExpect(jsonPath("$.payloadConflict").value(true));
-        mockMvc.perform(post("/api/transactions/batch")
+        mockMvc.perform(post("/api/transactions/batch").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("[" + conflictingRequest + "]"))
                 .andExpect(status().isConflict())
@@ -286,6 +293,34 @@ class TransactionApplicationTests {
     }
 
     @Test
+    void retryCandidateWaitsUntilItsPersistedBackoffDeadline() {
+        String suffix = suffix();
+        String account = "ACC-BACKOFF-" + suffix;
+        String id = "BACKOFF-" + suffix;
+        service.submit(request(id, "REQ-" + suffix, account, 1, TransactionType.CREDIT, "75", true));
+        service.runProcessingNow();
+
+        TransactionRecord retry = transactions.findByTransactionId(id).orElseThrow();
+        assertEquals(TransactionStatus.RETRY_PENDING, retry.getStatus());
+        retry.setNextAttemptAt(Instant.now().plusSeconds(60));
+        transactions.saveAndFlush(retry);
+
+        service.runProcessingNow();
+        TransactionRecord deferred = transactions.findByTransactionId(id).orElseThrow();
+        assertEquals(TransactionStatus.RETRY_PENDING, deferred.getStatus());
+        assertEquals(1, deferred.getAttempts());
+        assertAmount("0", accounts.findById(account).orElseThrow().getBalance());
+
+        deferred.setNextAttemptAt(Instant.now().minusMillis(1));
+        transactions.saveAndFlush(deferred);
+        service.runProcessingNow();
+        TransactionRecord completed = transactions.findByTransactionId(id).orElseThrow();
+        assertEquals(TransactionStatus.PROCESSED, completed.getStatus());
+        assertEquals(2, completed.getAttempts());
+        assertAmount("75", accounts.findById(account).orElseThrow().getBalance());
+    }
+
+    @Test
     void repeatedTransientFailuresStopAtConfiguredAttemptLimit() {
         String suffix = suffix();
         String account = "ACC-MAX-RETRY-" + suffix;
@@ -323,7 +358,7 @@ class TransactionApplicationTests {
                 }
                 """.formatted(id, account);
 
-        mockMvc.perform(post("/api/transactions")
+        mockMvc.perform(post("/api/transactions").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalidRequest))
                 .andExpect(status().isBadRequest())
@@ -343,7 +378,7 @@ class TransactionApplicationTests {
                   "sequenceNumber":1
                 }
                 """.formatted(id, account);
-        mockMvc.perform(post("/api/transactions")
+        mockMvc.perform(post("/api/transactions").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(validRequest))
                 .andExpect(status().isAccepted())
@@ -406,7 +441,7 @@ class TransactionApplicationTests {
                 """.formatted(secondId, suffix, account, firstId, suffix, account, firstId, suffix, account,
                 invalidId, suffix, suffix);
 
-        mockMvc.perform(post("/api/transactions/batch")
+        mockMvc.perform(post("/api/transactions/batch").with(httpBasic("test-api", "test-password"))
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(batch))
                 .andExpect(status().isAccepted())
@@ -446,7 +481,7 @@ class TransactionApplicationTests {
                 TransactionType.CREDIT, "75", false));
         service.runProcessingNow();
 
-        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/api/accounts"))
+        mockMvc.perform(get("/api/accounts").with(httpBasic("test-api", "test-password")))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[?(@.accountId == '%s')].balance".formatted(firstAccount))
                         .value(org.hamcrest.Matchers.contains(125.0)))
@@ -454,6 +489,28 @@ class TransactionApplicationTests {
                         .value(org.hamcrest.Matchers.contains(2)))
                 .andExpect(jsonPath("$[?(@.accountId == '%s')].balance".formatted(secondAccount))
                         .value(org.hamcrest.Matchers.contains(75.0)));
+    }
+
+    @Test
+    void apiRequiresAuthenticationAndActuatorHealthIsPublic() throws Exception {
+        mockMvc.perform(get("/api/processing/summary"))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(get("/api/processing/summary").with(httpBasic("test-api", "wrong-password")))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(get("/actuator/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"))
+                .andExpect(jsonPath("$.components").doesNotExist());
+        mockMvc.perform(get("/actuator/metrics"))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(get("/actuator/prometheus"))
+                .andExpect(status().isUnauthorized());
+        mockMvc.perform(get("/actuator/metrics").with(httpBasic("test-api", "test-password")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.names").isArray());
+        mockMvc.perform(get("/actuator/prometheus").with(httpBasic("test-api", "test-password")))
+                .andExpect(status().isOk())
+                .andExpect(content().contentTypeCompatibleWith("text/plain"));
     }
 
     @Test
