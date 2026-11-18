@@ -40,7 +40,7 @@ public class TransactionService {
             return submissionService.submit(request);
         } catch (DataIntegrityViolationException exception) {
             if (transactions.findByTransactionId(request.transactionId()).isPresent()) {
-                return submissionService.duplicate(request.transactionId(), request.requestId());
+                return submissionService.duplicate(request);
             }
             throw exception;
         }
@@ -50,6 +50,7 @@ public class TransactionService {
         List<BatchItemResult> results = new ArrayList<>(requests.size());
         int accepted = 0;
         int duplicates = 0;
+        int conflicts = 0;
         int rejected = 0;
 
         for (int index = 0; index < requests.size(); index++) {
@@ -57,7 +58,7 @@ public class TransactionService {
             if (request == null) {
                 String reason = "Transaction record cannot be null.";
                 recordRejectedSubmission(null, reason);
-                results.add(new BatchItemResult(index, null, TransactionStatus.FAILED.name(), false, reason));
+                results.add(new BatchItemResult(index, null, TransactionStatus.FAILED.name(), false, false, reason));
                 rejected++;
                 continue;
             }
@@ -69,22 +70,26 @@ public class TransactionService {
             if (!validationErrors.isEmpty()) {
                 recordRejectedSubmission(request, validationErrors);
                 results.add(new BatchItemResult(index, request.transactionId(),
-                        TransactionStatus.FAILED.name(), false, validationErrors));
+                        TransactionStatus.FAILED.name(), false, false, validationErrors));
                 rejected++;
                 continue;
             }
 
             SubmissionResult result = submit(request);
             results.add(new BatchItemResult(index, request.transactionId(), result.status().name(),
-                    result.duplicate(), result.message()));
+                    result.duplicate(), result.payloadConflict(), result.message()));
             if (result.duplicate()) {
                 duplicates++;
+                if (result.payloadConflict()) {
+                    conflicts++;
+                }
             } else {
                 accepted++;
             }
         }
 
-        return new BatchSubmissionResult(requests.size(), accepted, duplicates, rejected, List.copyOf(results));
+        return new BatchSubmissionResult(requests.size(), accepted, duplicates, conflicts, rejected,
+                List.copyOf(results));
     }
 
     public void recordRejectedSubmission(TransactionRequest request, String reason) {

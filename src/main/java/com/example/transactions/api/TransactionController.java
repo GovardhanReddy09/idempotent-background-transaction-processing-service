@@ -20,7 +20,9 @@ public class TransactionController {
     @PostMapping("/transactions")
     public ResponseEntity<?> submit(@Valid @RequestBody TransactionRequest request) {
         var result = service.submit(request);
-        return ResponseEntity.status(result.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED).body(result);
+        HttpStatus status = result.payloadConflict() ? HttpStatus.CONFLICT
+                : result.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED;
+        return ResponseEntity.status(status).body(result);
     }
 
     @PostMapping("/transactions/batch")
@@ -34,6 +36,7 @@ public class TransactionController {
 
         var result = service.submitBatch(requests);
         HttpStatus status = result.accepted() > 0 ? HttpStatus.ACCEPTED
+                : result.conflicts() > 0 ? HttpStatus.CONFLICT
                 : result.duplicates() > 0 ? HttpStatus.OK : HttpStatus.BAD_REQUEST;
         return ResponseEntity.status(status).body(result);
     }

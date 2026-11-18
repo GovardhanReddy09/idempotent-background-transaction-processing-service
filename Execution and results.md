@@ -26,7 +26,7 @@ On the fresh database, the summary should initially show zero for each status an
 
 ## 2. Run the fixed six-row batch sample
 
-The batch demonstrates four unique valid transactions, one duplicate attempt, and one invalid amount. It also submits sequence 2 before sequence 1 on `ACC-201`, and triggers a one-time simulated retry on `ACC-203`.
+The batch demonstrates four unique valid transactions, one duplicate attempt, and one invalid amount. It also submits sequence 2 before sequence 1 on `ACC-201`. `TXN-2005` retains the assessment's sequence number 5 on a new account, so it demonstrates the missing-sequence wait; its simulated retry is configured but does not run.
 
 ```powershell
 $batch = Get-Content .\sample-transactions.json -Raw
@@ -43,7 +43,7 @@ duplicates: 1
 rejected  : 1
 ```
 
-Each `results` entry corresponds to an input row. New valid rows initially show `RECEIVED`; the repeated `TXN-2002` row shows `DUPLICATE`; invalid `TXN-2004` shows `FAILED` with an amount-validation reason. `TXN-2004` is retained in the failed-submission audit and counted in the total, but it does not become a business transaction or create `ACC-202`.
+Each `results` entry corresponds to an input row. New valid rows initially show `RECEIVED`; the repeated `TXN-2002` row uses request ID `REQ-2-DUP` and shows `DUPLICATE`; invalid `TXN-2004` shows `FAILED` with an amount-validation reason. `TXN-2004` is retained in the failed-submission audit and counted in the total, but it does not become a business transaction or create `ACC-202`.
 
 ### What happened inside the service?
 
@@ -52,16 +52,16 @@ Each `results` entry corresponds to an input row. New valid rows initially show 
 3. The invalid row was recorded in the failed-submission audit. It did not occupy a transaction ID or account sequence.
 4. The scheduled processor checks for eligible rows every two seconds. You can trigger it explicitly to make the walkthrough immediate.
 
-## 3. Process rows, ordering, and simulated retry
+## 3. Process rows, ordering, and sequence gap
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri "$base/api/processing/run" | ConvertTo-Json -Depth 8
 Invoke-RestMethod -Method Post -Uri "$base/api/processing/run" | ConvertTo-Json -Depth 8
 ```
 
-On the first pass, the worker sorts work by account and sequence. For `ACC-201`, sequence 1 (`TXN-2001`) is processed before sequence 2 (`TXN-2002`), even though sequence 2 appeared first in the input. Sequence 3 (`TXN-2003`) follows. The first attempt for `TXN-2005` is intentionally simulated to fail: it becomes `RETRY_PENDING` without changing the balance or sequence. On the next pass it succeeds. If the two-second scheduled worker runs between commands, a transaction may already have advanced to its next status; that is normal.
+On the first pass, the worker processes `ACC-201` in sequence order: sequence 1 (`TXN-2001`) before sequence 2 (`TXN-2002`), then sequence 3 (`TXN-2003`). `TXN-2005` on `ACC-203` becomes `PENDING_ORDER` because the account expects sequence 1; neither its attempt count nor balance changes. A second pass leaves it pending until sequences 1-4 are submitted. If the two-second scheduled worker runs between commands, a transaction may already have advanced to its next status; that is normal.
 
-The worker response describes that invocation (`evaluatedThisRun`, `processedThisRun`, `retryScheduledThisRun`, `failedThisRun`, and current status counts). These are not a second submission; invoking processing repeatedly does not apply the same credit/debit twice.
+The worker response describes that invocation (`evaluatedThisRun`, `processedThisRun`, `retryScheduledThisRun`, `failedThisRun`, and current status counts). These are not a second submission; invoking processing repeatedly does not apply the same credit/debit twice. Each tick reads a bounded set of candidate IDs, then uses transaction-row and account-row locks for concurrent workers sharing the database.
 
 ## 4. Check specific transactions, all accounts, and totals
 
@@ -73,15 +73,16 @@ Invoke-RestMethod -Method Get -Uri "$base/api/accounts" | ConvertTo-Json -Depth 
 Invoke-RestMethod -Method Get -Uri "$base/api/processing/summary" | ConvertTo-Json -Depth 8
 ```
 
-When processing and retrying have completed, expect:
+When the sample's processing passes have completed, expect:
 
 | Check | Expected result |
 |---|---|
-| `TXN-2001`, `TXN-2002`, `TXN-2003`, `TXN-2005` | `PROCESSED` |
+| `TXN-2001`, `TXN-2002`, `TXN-2003` | `PROCESSED` |
+| `TXN-2005` | `PENDING_ORDER`, attempts `0`; ACC-203 still expects sequence `1` |
 | `TXN-2004` in the batch result | `FAILED`; it is not returned by `GET /api/transactions/{id}` because it is an audited invalid submission, not an accepted business transaction |
 | `ACC-201` | Balance `85.00`, next expected sequence `4` (`100` credit - `40` debit + `25` credit) |
-| `ACC-203` | Balance `500.00`, next expected sequence `2` |
-| Summary | `PROCESSED: 4`, `DUPLICATE: 1`, `FAILED: 1`, `RECEIVED: 0`, `uniqueTransactions: 4`, `total: 6` |
+| `ACC-203` | Balance `0.00`, next expected sequence `1` |
+| Summary | `PROCESSED: 3`, `PENDING_ORDER: 1`, `DUPLICATE: 1`, `FAILED: 1`, `RECEIVED: 0`, `uniqueTransactions: 4`, `total: 6` |
 
 The summary counts **all six submission attempts**: four accepted unique transactions, one duplicate, and one invalid submission. Status totals show their current/final statuses, so a processed transaction is counted under `PROCESSED`, not `RECEIVED`.
 
@@ -99,9 +100,9 @@ should return these summary values on the fresh database:
 {
   "RECEIVED": 0,
   "PROCESSING": 0,
-  "PROCESSED": 4,
+  "PROCESSED": 3,
   "DUPLICATE": 1,
-  "PENDING_ORDER": 0,
+  "PENDING_ORDER": 1,
   "RETRY_PENDING": 0,
   "FAILED": 1,
   "uniqueTransactions": 4,
@@ -120,15 +121,15 @@ should return these summary values on the fresh database:
   },
   {
     "accountId": "ACC-203",
-    "balance": 500.00,
-    "nextExpectedSequence": 2
+    "balance": 0.00,
+    "nextExpectedSequence": 1
   }
 ]
 ```
 
-The accepted transaction lookup commands return a transaction object whose important fields include the requested `transactionId`, final `"status": "PROCESSED"`, and the submitted account, amount, and sequence. For example, `TXN-2001` is sequence 1 on `ACC-201` for a 100 INR credit, and `TXN-2005` is sequence 1 on `ACC-203` for a 500 INR credit. `TXN-2005` should have two processing attempts because its first attempt was intentionally simulated to fail. Do not expect `TXN-2004` from the transaction lookup endpoint: that invalid request is available in the batch result as `FAILED` and in the summary's failed count.
+The accepted transaction lookup commands return the stored transaction and its current status. `TXN-2001` is sequence 1 on `ACC-201` for a 100 INR credit. `TXN-2005` is sequence 5 on `ACC-203` for a 500 INR credit; it has zero processing attempts until that account receives valid sequences 1-4. The simulated retry occurs only after the missing sequence gap is filled. Do not expect `TXN-2004` from the transaction lookup endpoint: that invalid request is available in the batch result as `FAILED` and in the summary's failed count.
 
-The `POST /api/processing/run` response reports work performed in that particular call. A typical run may show `processedThisRun: 3` and `retryScheduledThisRun: 1` on the first pass, then `processedThisRun: 1` on the next. If the scheduled worker processes some rows before the manual command, these per-run figures will differ; the final account balances and summary above remain the expected result.
+The `POST /api/processing/run` response reports work performed in that particular call. A typical run may show `processedThisRun: 3` and `evaluatedThisRun: 4` on the first pass, then `processedThisRun: 0` and `evaluatedThisRun: 1` on the next because the sequence-5 row remains pending. If the scheduled worker processes some rows before the manual command, these per-run figures will differ; the final account balances and summary above remain the expected result.
 
 ## 5. Demonstrate individual submissions instead
 
@@ -150,13 +151,13 @@ The batch script reads `sample-transactions.json`, submits all six rows together
 
 ## 6. Explain the core design in the interview
 
-- **Idempotency:** `transactionId` is the business key. Duplicate attempts are audited separately and cannot apply another financial effect.
+- **Idempotency:** `transactionId` is the business key. Identical retries are audited as duplicates; a reused key with a different business payload returns HTTP 409 and is marked as a payload conflict.
 - **Ordering:** sequence numbers start at 1 independently per account. A future sequence waits for the missing sequence; it is not applied out of order.
 - **Safe retries:** a simulated transient failure changes no balance or account sequence. A later processing pass can retry it. Attempts are capped by `app.worker.max-attempts` (default 3).
 - **Failure isolation:** invalid batch items become audited `FAILED` attempts without blocking valid rows. They do not occupy transaction IDs or account sequences.
 - **Atomicity:** account balance, next sequence, and transaction status updates are committed together through the database transaction.
 - **Operational visibility:** transaction lookup, account endpoints, worker-run output, logs, and the processing summary show what was accepted and how it was handled.
-- **Trade-offs:** the assessment uses a scheduled database poller and local H2, not Kafka or a production database. Multi-instance work claiming, authentication, migrations, production retry backoff, and monitoring would need to be added for a production deployment.
+- **Trade-offs:** the assessment uses a scheduled database poller and local H2, not Kafka or a production database. Production still needs migrations, lock-timeout/load testing, authentication, retry backoff, and monitoring.
 
 ## 7. End the demo
 

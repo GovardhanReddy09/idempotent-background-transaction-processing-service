@@ -5,7 +5,7 @@ A lightweight transaction ingestion and background-processing service for the FD
 ## Step-by-step implementation
 
 1. **Validate and accept** each transaction over REST. Invalid requests return HTTP 400 (single endpoint) or a per-item `FAILED` result (batch); validation failures are recorded in a separate audit table.
-2. **Persist idempotently** using `transactionId` as the business key, backed by a database unique constraint. A repeated key returns `DUPLICATE` and cannot create another business effect.
+2. **Persist idempotently** using `transactionId` as the business key, backed by a database unique constraint. An identical repeated key returns `DUPLICATE`; reusing it for a different business payload returns HTTP 409 and cannot create another effect.
 3. **Order per account** by contiguous sequence numbers beginning at 1. The worker processes an expected sequence, holds future sequences in `PENDING_ORDER`, and fails stale or conflicting sequences.
 4. **Apply the business effect atomically** with the status change and account sequence advancement in a database transaction. A debit that would make the balance negative fails but consumes its sequence slot.
 5. **Retry transient failures safely.** The demo's `simulateFailureOnce` flag or optional `simulateFailureCount` (0-10) exercises retry paths: a failed attempt applies no balance or sequence change and becomes `RETRY_PENDING`. Attempts are capped by configuration.
@@ -22,7 +22,7 @@ mvn spring-boot:run
 java -jar target/idempotent-transaction-service-1.0.0.jar
 ```
 
-`mvn clean package` creates the single runnable artifact `target/idempotent-transaction-service-1.0.0.jar`. Run either `mvn spring-boot:run` or the JAR command above (not both on the same port). The service listens on `http://localhost:8080`. Data is stored in the local H2 file `./data/transactions`. The development H2 console is at `http://localhost:8080/h2-console` (JDBC URL `jdbc:h2:file:./data/transactions`, user `sa`, blank password).
+`mvn clean package` creates the single runnable artifact `target/idempotent-transaction-service-1.0.0.jar`. Run either `mvn spring-boot:run` or the JAR command above (not both on the same port). The service listens on `http://localhost:8080`. Data is stored in the local H2 file `./data/transactions`. The development H2 console is disabled; use repository/API inspection or explicit database tooling when diagnosing persisted state.
 
 ## API
 
@@ -34,7 +34,7 @@ curl.exe -i -X POST http://localhost:8080/api/transactions `
   -d "{\"transactionId\":\"TXN-1\",\"requestId\":\"REQ-1\",\"accountId\":\"ACC-1\",\"transactionType\":\"CREDIT\",\"amount\":100.00,\"currency\":\"INR\",\"sequenceNumber\":1}"
 ```
 
-New requests return HTTP 202 and `RECEIVED`; a duplicate `transactionId` returns HTTP 200 and `DUPLICATE`. The scheduled worker runs every two seconds. Trigger it immediately for a demo:
+New requests return HTTP 202 and `RECEIVED`; an identical duplicate `transactionId` returns HTTP 200 and `DUPLICATE`. Reusing the key with a different business payload returns HTTP 409 and `payloadConflict: true`. Both outcomes are recorded in the duplicate audit. The scheduled worker runs every two seconds. Trigger it immediately for a demo:
 
 ```shell
 curl.exe -X POST http://localhost:8080/api/processing/run
@@ -107,6 +107,8 @@ Invoke-RestMethod -Method Get -Uri "$base/api/accounts"
 
 The batch endpoint returns a result for each input index. New valid records are accepted independently, repeated IDs are reported as `DUPLICATE`, and Bean Validation failures are reported as `FAILED` without blocking other records. A batch may contain up to 500 items. The worker applies the same sequence and retry rules to single records and batches.
 
+For a conflicting key in a batch, that item's result sets `payloadConflict: true` and the response increments `conflicts`; unrelated batch items still receive their own outcomes.
+
 #### Check what a duplicate request does
 
 Submit the *same* body twice, keeping the same `transactionId`:
@@ -121,11 +123,11 @@ Invoke-RestMethod -Method Get -Uri "$base/api/accounts"
 Invoke-RestMethod -Method Get -Uri "$base/api/processing/summary"
 ```
 
-The second submission returns `DUPLICATE` and is counted in the summary, but the account balance increases only once. Use a new transaction ID and the next sequence number to make another business transaction.
+The second submission returns `DUPLICATE` and is counted in the summary, but the account balance increases only once. Reuse the ID with a different account, direction, amount, currency, or sequence to get HTTP 409 with `payloadConflict: true`; the original transaction remains unchanged. Use a new transaction ID and the next sequence number to make another business transaction.
 
 ## Sample input and output
 
-`sample-transactions.json` is an intentionally challenging batch: sequence 2 before sequence 1 on `ACC-201`, a duplicate ID, a negative amount, and a one-time simulated transient failure on `ACC-203`. Sequence numbers start at 1 independently for each account, so the first `ACC-203` transaction uses sequence 1 even though it appears as the sixth input row. `TXN-2004` has sequence 4 as suggested, but its negative amount is rejected before sequencing and it does not create an `ACC-202` account. Submit the whole file to `POST /api/transactions/batch`.
+`sample-transactions.json` is an intentionally challenging batch: sequence 2 before sequence 1 on `ACC-201`, a duplicate ID, a negative amount, and a sequence-5 row on new account `ACC-203` with a one-time retry hook. That last row remains `PENDING_ORDER` because the account expects sequence 1; its hook cannot run until sequences 1-4 are submitted. `TXN-2004` has sequence 4, but its negative amount is rejected before sequencing and it does not create an `ACC-202` account. Submit the whole file to `POST /api/transactions/batch`.
 
 Example accepted response:
 
@@ -149,14 +151,13 @@ Example duplicate response:
 }
 ```
 
-After processing the sample, the batch result reports `accepted: 4`, `duplicates: 1`, and `rejected: 1`. After the retry pass, `GET /api/processing/summary` reports `PROCESSED: 4`, `DUPLICATE: 1`, `FAILED: 1`, `uniqueTransactions: 4`, and `total: 6` (all six input attempts). `RECEIVED` is `0` because it is a current status, not the total number ever received. `GET /api/accounts` lists all created accounts with balances and next expected sequences. The valid rows affect `ACC-201` (balance `85.00`, next sequence `4`: 100 credit - 40 debit + 25 credit) and `ACC-203` (balance `500.00`, next sequence `2`). The `ACC-202` request is invalid (negative amount), so it is audited as failed and does not create an account.
+After processing the sample, the batch result reports `accepted: 4`, `duplicates: 1`, and `rejected: 1`. The final summary reports `PROCESSED: 3`, `PENDING_ORDER: 1`, `DUPLICATE: 1`, `FAILED: 1`, `uniqueTransactions: 4`, and `total: 6` (all six input attempts). `RECEIVED` is `0` because it is a current status, not the total number ever received. `ACC-201` ends at balance `85.00`, next sequence `4`; `ACC-203` remains at balance `0.00`, next sequence `1`. `TXN-2005` has zero attempts until `ACC-203` receives sequences 1-4, so the simulated retry is intentionally not reached by this sample. The `ACC-202` request is invalid (negative amount), so it is audited as failed and does not create an account.
 
-If `TXN-2005` on the new `ACC-203` account is assigned sequence 5, it correctly remains `PENDING_ORDER`: sequences 1-4 for that account have not been submitted. It will not reach the simulated retry until those missing transactions are supplied. Keep it at sequence 1 to exercise the retry scenario in this standalone sample. The suggested sequence-5 row can be used as a separate gap-ordering test.
 
 ## Tests and operational visibility
 
-`mvn test` runs Spring integration tests for sequential and concurrent duplicate idempotency, concurrent worker triggers, batch submission and invalid-record isolation, out-of-order processing, deferred retries without duplicate effects, retry exhaustion, invalid HTTP input isolation, and failed-debit sequence advancement. `GET /api/processing/summary` reports current transaction status counts plus separately audited duplicate and rejected attempts. Worker logs include successful processing and retry scheduling.
+`mvn test` runs Spring integration tests for sequential and concurrent duplicate idempotency, conflicting idempotency payloads, concurrent worker triggers, the original sample file and its sequence-5 gap, batch submission and invalid-record isolation, out-of-order processing, deferred retries without duplicate effects, retry exhaustion, invalid HTTP input isolation, and failed-debit sequence advancement. GitHub Actions runs the same test suite on pushes and pull requests. Each tick selects a bounded set of candidate IDs, then uses transaction-row and account-row locks to safely recheck and process work across service instances. `GET /api/processing/summary` reports current transaction status counts plus separately audited duplicate and rejected attempts. Worker logs avoid account IDs.
 
 ## Scope and limitations
 
-This assessment implementation deliberately uses a single-process scheduled database poller. It has no real queue, authentication, or multi-worker coordination. `simulateFailureOnce` is a deterministic demo hook, not a production failure mechanism. H2 schema auto-update and the H2 console are for local development only. See [DESIGN.md](DESIGN.md) for semantics, trade-offs, and production hardening.
+This assessment implementation uses a scheduled database poller, not a message broker. Database row locks coordinate multiple service instances while the database supports the locking semantics used here; this is not a substitute for production migrations, tuned lock timeouts, authentication, or monitoring. `simulateFailureOnce` is a deterministic demo hook, not a production failure mechanism. H2 schema auto-update is for local development only, and the H2 console is disabled. See [DESIGN.md](DESIGN.md) for semantics, trade-offs, and production hardening.

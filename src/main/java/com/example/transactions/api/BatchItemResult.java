@@ -5,5 +5,6 @@ public record BatchItemResult(
         String transactionId,
         String status,
         boolean duplicate,
+        boolean payloadConflict,
         String message
 ) {}

@@ -8,6 +8,8 @@ import com.example.transactions.repository.FailedSubmissionRepository;
 import com.example.transactions.repository.TransactionRepository;
 import com.example.transactions.service.SubmissionResult;
 import com.example.transactions.service.TransactionService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -16,6 +18,9 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -50,6 +55,9 @@ class TransactionApplicationTests {
     @Autowired
     private MockMvc mockMvc;
 
+    @Autowired
+    private ObjectMapper objectMapper;
+
     @Test
     void duplicateBusinessTransactionDoesNotCreateAnotherEffect() {
         String suffix = suffix();
@@ -60,7 +68,7 @@ class TransactionApplicationTests {
         assertFalse(service.submit(request(id, "REQ-" + suffix, account, 1,
                 TransactionType.CREDIT, "50", false)).duplicate());
         assertTrue(service.submit(request(id, "REQ-DUP-" + suffix, account, 1,
-                TransactionType.CREDIT, "500", false)).duplicate());
+                TransactionType.CREDIT, "50", false)).duplicate());
 
         service.runProcessingNow();
 
@@ -69,6 +77,59 @@ class TransactionApplicationTests {
         assertEquals(1, duplicateSubmissions.countByTransactionId(id));
         assertAmount("50", accounts.findById(account).orElseThrow().getBalance());
         assertEquals(duplicateCountBefore + 1, service.summary().get("DUPLICATE"));
+    }
+
+    @Test
+    void reusedTransactionIdWithDifferentPayloadIsReportedAsConflict() throws Exception {
+        String suffix = suffix();
+        String id = "CONFLICT-" + suffix;
+        String account = "ACC-CONFLICT-" + suffix;
+        String originalRequest = """
+                {
+                  "transactionId":"%s",
+                  "requestId":"REQ-ORIGINAL",
+                  "accountId":"%s",
+                  "transactionType":"CREDIT",
+                  "amount":50.00,
+                  "currency":"INR",
+                  "sequenceNumber":1
+                }
+                """.formatted(id, account);
+        String conflictingRequest = """
+                {
+                  "transactionId":"%s",
+                  "requestId":"REQ-RETRY",
+                  "accountId":"%s",
+                  "transactionType":"CREDIT",
+                  "amount":500.00,
+                  "currency":"INR",
+                  "sequenceNumber":1
+                }
+                """.formatted(id, account);
+
+        mockMvc.perform(post("/api/transactions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(originalRequest))
+                .andExpect(status().isAccepted());
+        mockMvc.perform(post("/api/transactions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(conflictingRequest))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.duplicate").value(true))
+                .andExpect(jsonPath("$.payloadConflict").value(true));
+        mockMvc.perform(post("/api/transactions/batch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("[" + conflictingRequest + "]"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.conflicts").value(1))
+                .andExpect(jsonPath("$.results[0].payloadConflict").value(true));
+
+        assertEquals(1, transactions.findAll().stream()
+                .filter(transaction -> transaction.getTransactionId().equals(id)).count());
+        assertEquals(2, duplicateSubmissions.countByTransactionId(id));
+        assertEquals(2, duplicateSubmissions.countByPayloadConflictTrue());
+        service.runProcessingNow();
+        assertAmount("50", accounts.findById(account).orElseThrow().getBalance());
     }
 
     @Test
@@ -159,6 +220,47 @@ class TransactionApplicationTests {
         assertEquals(TransactionStatus.PROCESSED,
                 transactions.findByTransactionId(secondId).orElseThrow().getStatus());
         assertAmount("20", accounts.findById(account).orElseThrow().getBalance());
+    }
+
+    @Test
+    void originalSampleKeepsSequenceFiveGapPendingAndDoesNotRunItsRetryHook() throws Exception {
+        List<TransactionRequest> sample = objectMapper.readValue(
+                Files.readString(Path.of("sample-transactions.json")),
+                new TypeReference<>() {});
+        TransactionRequest duplicate = sample.get(2);
+        TransactionRequest retry = sample.get(5);
+        assertEquals("REQ-2-DUP", duplicate.requestId());
+        assertEquals("TXN-2005", retry.transactionId());
+        assertEquals(5, retry.sequenceNumber());
+        assertTrue(retry.simulateFailureOnce());
+
+        var summaryBefore = service.summary();
+        var result = service.submitBatch(sample);
+        assertEquals(4, result.accepted());
+        assertEquals(1, result.duplicates());
+        assertEquals(0, result.conflicts());
+        assertEquals(1, result.rejected());
+        service.runProcessingNow();
+        service.runProcessingNow();
+
+        assertEquals(TransactionStatus.PROCESSED,
+                transactions.findByTransactionId("TXN-2001").orElseThrow().getStatus());
+        assertEquals(TransactionStatus.PROCESSED,
+                transactions.findByTransactionId("TXN-2002").orElseThrow().getStatus());
+        assertEquals(TransactionStatus.PROCESSED,
+                transactions.findByTransactionId("TXN-2003").orElseThrow().getStatus());
+        TransactionRecord waiting = transactions.findByTransactionId("TXN-2005").orElseThrow();
+        assertEquals(TransactionStatus.PENDING_ORDER, waiting.getStatus());
+        assertEquals(0, waiting.getAttempts());
+        assertAmount("85", accounts.findById("ACC-201").orElseThrow().getBalance());
+        assertAmount("0", accounts.findById("ACC-203").orElseThrow().getBalance());
+        assertEquals(1, accounts.findById("ACC-203").orElseThrow().getNextSequence());
+        var summaryAfter = service.summary();
+        assertEquals(3, countDelta(summaryBefore, summaryAfter, "PROCESSED"));
+        assertEquals(1, countDelta(summaryBefore, summaryAfter, "PENDING_ORDER"));
+        assertEquals(1, countDelta(summaryBefore, summaryAfter, "DUPLICATE"));
+        assertEquals(1, countDelta(summaryBefore, summaryAfter, "FAILED"));
+        assertEquals(6, countDelta(summaryBefore, summaryAfter, "total"));
     }
 
     @Test
@@ -395,5 +497,9 @@ class TransactionApplicationTests {
 
     private void assertAmount(String expected, BigDecimal actual) {
         assertEquals(0, new BigDecimal(expected).compareTo(actual));
+    }
+
+    private long countDelta(java.util.Map<String, Object> before, java.util.Map<String, Object> after, String key) {
+        return ((Number) after.get(key)).longValue() - ((Number) before.get(key)).longValue();
     }
 }

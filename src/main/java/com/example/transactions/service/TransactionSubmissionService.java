@@ -9,8 +9,8 @@ import com.example.transactions.repository.AccountRepository;
 import com.example.transactions.repository.DuplicateSubmissionRepository;
 import com.example.transactions.repository.TransactionRepository;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class TransactionSubmissionService {
@@ -28,7 +28,7 @@ public class TransactionSubmissionService {
     @Transactional
     public SubmissionResult submit(TransactionRequest request) {
         if (transactions.findByTransactionId(request.transactionId()).isPresent()) {
-            return duplicate(request.transactionId(), request.requestId());
+            return duplicate(request);
         }
 
         TransactionRecord transaction = transactions.saveAndFlush(new TransactionRecord(
@@ -42,14 +42,28 @@ public class TransactionSubmissionService {
                 Math.max(request.simulateFailureCount(), request.simulateFailureOnce() ? 1 : 0)));
         accounts.findById(request.accountId())
                 .orElseGet(() -> accounts.save(new Account(request.accountId())));
-        return new SubmissionResult(transaction.getTransactionId(), TransactionStatus.RECEIVED, false,
+        return new SubmissionResult(transaction.getTransactionId(), TransactionStatus.RECEIVED, false, false,
                 "Accepted for background processing.");
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public SubmissionResult duplicate(String transactionId, String requestId) {
-        duplicates.save(new DuplicateSubmission(transactionId, requestId));
-        return new SubmissionResult(transactionId, TransactionStatus.DUPLICATE, true,
-                "Business transaction already exists; no second effect will be applied.");
+    public SubmissionResult duplicate(TransactionRequest request) {
+        TransactionRecord existing = transactions.findByTransactionId(request.transactionId())
+                .orElseThrow(() -> new IllegalStateException("Duplicate transaction disappeared before audit."));
+        boolean payloadConflict = !sameBusinessPayload(existing, request);
+        duplicates.save(new DuplicateSubmission(request.transactionId(), request.requestId(), payloadConflict));
+        String message = payloadConflict
+                ? "transactionId is already associated with a different business payload."
+                : "Business transaction already exists; no second effect will be applied.";
+        return new SubmissionResult(request.transactionId(), TransactionStatus.DUPLICATE, true,
+                payloadConflict, message);
+    }
+
+    private boolean sameBusinessPayload(TransactionRecord existing, TransactionRequest request) {
+        return existing.getAccountId().equals(request.accountId())
+                && existing.getTransactionType() == request.transactionType()
+                && existing.getAmount().compareTo(request.amount()) == 0
+                && existing.getCurrency().equals(request.currency())
+                && existing.getSequenceNumber() == request.sequenceNumber();
     }
 }
