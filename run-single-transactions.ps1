@@ -2,6 +2,8 @@ param(
     [string]$BaseUrl = "http://localhost:8081"
 )
 
+. (Join-Path $PSScriptRoot "api-auth.ps1")
+$authHeaders = Get-ApiAuthorizationHeaders
 $suffix = Get-Date -Format "yyyyMMddHHmmssfff"
 $accountOne = "ACC-SINGLE-$suffix"
 $accountThree = "ACC-RETRY-$suffix"
@@ -18,7 +20,7 @@ function Submit-Transaction {
 
     $body = $Transaction | ConvertTo-Json -Compress
     Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/transactions" `
-        -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
+        -Headers $authHeaders -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8
 }
 
 Write-Host "Sending sequence 2 first; it will wait until sequence 1 arrives."
@@ -77,7 +79,7 @@ $invalidBody = @{
 } | ConvertTo-Json -Compress
 try {
     Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/transactions" `
-        -ContentType "application/json" -Body $invalidBody
+        -Headers $authHeaders -ContentType "application/json" -Body $invalidBody
     throw "The invalid transaction was unexpectedly accepted."
 } catch {
     if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 400) {
@@ -100,15 +102,16 @@ Submit-Transaction @{
 }
 
 Write-Host "Running the processor twice."
-Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" | ConvertTo-Json -Depth 8
-Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" -Headers $authHeaders | ConvertTo-Json -Depth 8
+Start-Sleep -Seconds 3
+Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" -Headers $authHeaders | ConvertTo-Json -Depth 8
 
 Write-Host "Checking each accepted transaction."
 foreach ($transactionId in @($transactionOne, $transactionTwo, $transactionThree, $transactionFive)) {
-    Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/transactions/$transactionId" |
+    Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/transactions/$transactionId" -Headers $authHeaders |
         ConvertTo-Json -Depth 8
 }
 
 Write-Host "Checking account balances and processing summary."
-Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/accounts" | ConvertTo-Json -Depth 8
-Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/processing/summary" | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/accounts" -Headers $authHeaders | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/processing/summary" -Headers $authHeaders | ConvertTo-Json -Depth 8

@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.util.*;
 
 public interface TransactionRepository extends JpaRepository<TransactionRecord, Long> {
@@ -15,11 +16,14 @@ public interface TransactionRepository extends JpaRepository<TransactionRecord, 
     @Query("""
             select t.id from TransactionRecord t
             where t.status in :statuses
+              and (t.status <> com.example.transactions.model.TransactionStatus.RETRY_PENDING
+                   or t.nextAttemptAt is null or t.nextAttemptAt <= :eligibleAt)
             order by case when t.status = com.example.transactions.model.TransactionStatus.PENDING_ORDER
                           then 1 else 0 end,
                      t.accountId asc, t.sequenceNumber asc, t.createdAt asc, t.id asc
             """)
-    List<Long> findCandidateIds(@Param("statuses") Collection<TransactionStatus> statuses, Pageable pageable);
+    List<Long> findCandidateIds(@Param("statuses") Collection<TransactionStatus> statuses,
+                                @Param("eligibleAt") Instant eligibleAt, Pageable pageable);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select t from TransactionRecord t where t.id = :id")

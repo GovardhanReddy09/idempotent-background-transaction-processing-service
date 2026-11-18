@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.logging.Logger;
 
@@ -22,10 +23,11 @@ public class TransactionWorkProcessor {
     private final TransactionRepository transactions;
     private final AccountRepository accounts;
     private final TransactionEffectRegistry effects;
+    private final RetryBackoff retryBackoff;
     private final int maxAttempts;
 
     public TransactionWorkProcessor(TransactionRepository transactions, AccountRepository accounts,
-            TransactionEffectRegistry effects,
+            TransactionEffectRegistry effects, RetryBackoff retryBackoff,
             @Value("${app.worker.max-attempts:3}") int maxAttempts) {
         if (maxAttempts < 1) {
             throw new IllegalArgumentException("app.worker.max-attempts must be at least 1");
@@ -33,6 +35,7 @@ public class TransactionWorkProcessor {
         this.transactions = transactions;
         this.accounts = accounts;
         this.effects = effects;
+        this.retryBackoff = retryBackoff;
         this.maxAttempts = maxAttempts;
     }
 
@@ -52,6 +55,7 @@ public class TransactionWorkProcessor {
         if (tx.getSequenceNumber() < account.getNextSequence()) {
             tx.setStatus(TransactionStatus.FAILED);
             tx.setFailureReason("Stale or conflicting sequence number");
+            tx.setNextAttemptAt(null);
             return Outcome.FAILED;
         }
 
@@ -62,10 +66,12 @@ public class TransactionWorkProcessor {
             tx.setFailureReason("Simulated transient failure");
             if (tx.getAttempts() < maxAttempts) {
                 tx.setStatus(TransactionStatus.RETRY_PENDING);
+                tx.setNextAttemptAt(Instant.now().plus(retryBackoff.delayAfterAttempt(tx.getAttempts())));
                 LOGGER.info(() -> "Retry scheduled attempt=" + tx.getAttempts());
                 return Outcome.RETRIED;
             }
             tx.setStatus(TransactionStatus.FAILED);
+            tx.setNextAttemptAt(null);
             account.advanceSequence();
             return Outcome.FAILED;
         }
@@ -74,6 +80,7 @@ public class TransactionWorkProcessor {
         if (newBalance.compareTo(BigDecimal.ZERO) < 0) {
             tx.setStatus(TransactionStatus.FAILED);
             tx.setFailureReason("Insufficient funds");
+            tx.setNextAttemptAt(null);
             account.advanceSequence();
             return Outcome.FAILED;
         }
@@ -81,6 +88,7 @@ public class TransactionWorkProcessor {
         account.setBalance(newBalance);
         account.advanceSequence();
         tx.setStatus(TransactionStatus.PROCESSED);
+        tx.setNextAttemptAt(null);
         tx.setFailureReason(null);
         LOGGER.info("Transaction processed");
         return Outcome.PROCESSED;

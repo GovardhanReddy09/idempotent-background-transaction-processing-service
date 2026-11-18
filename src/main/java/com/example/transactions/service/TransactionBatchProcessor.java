@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.LinkedHashMap;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -40,6 +41,7 @@ public class TransactionBatchProcessor {
         int evaluated = 0;
         List<Long> work = transactions.findCandidateIds(
                 List.of(TransactionStatus.RECEIVED, TransactionStatus.RETRY_PENDING, TransactionStatus.PENDING_ORDER),
+                Instant.now(),
                 PageRequest.of(0, batchSize));
 
         for (Long transactionId : work) {
