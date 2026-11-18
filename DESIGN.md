@@ -6,11 +6,11 @@
 
 ## Idempotency
 
-`transactionId` is the business idempotency key and has a database unique constraint. A request using an existing key receives a `DUPLICATE` response and creates a separate duplicate-attempt audit row; the already-recorded transaction remains the only transaction that can change the account. A unique-key race is caught outside the failed insert transaction and translated into the same duplicate response and audit entry if the winning transaction is visible. The processor applies balance, sequence, and status changes atomically, so a failed attempt that is retried cannot leave a partial balance update.
+`transactionId` is the business idempotency key and has a database unique constraint. An existing key with the same account, transaction type, amount, currency, and sequence returns `DUPLICATE`; a different business payload returns HTTP 409 and sets `payloadConflict`. Request IDs and the demo-only failure hook are not business payload fields. Both outcomes create a duplicate-attempt audit row, including a conflict flag; the original transaction remains the only one that can change the account. A unique-key race is caught outside the failed insert transaction and translated into the same duplicate/conflict response and audit entry if the winning transaction is visible. The processor applies balance, sequence, and status changes atomically, so a failed attempt that is retried cannot leave a partial balance update.
 
 ## Ordering contract
 
-Sequence numbers are contiguous and start at 1 independently for each account. The worker orders eligible rows by account, sequence number, acceptance time, then generated record ID:
+Sequence numbers are contiguous and start at 1 independently for each account. Within new/retry work and pending-gap work, the worker orders candidates by account, sequence number, acceptance time, then generated record ID:
 
 - A number greater than `nextSequence` becomes `PENDING_ORDER` and makes no account change.
 - A number equal to `nextSequence` is eligible to apply.
@@ -20,11 +20,11 @@ Sequence numbers are contiguous and start at 1 independently for each account. T
 
 This is strict in-order processing rather than arrival-order processing. It intentionally does not infer a missing sequence or skip a gap.
 
-Sequence numbering starts independently at 1 for every account. Thus an isolated first transaction for a new account must use sequence 1 to reach processing and exercise retries. A first transaction submitted with sequence 5 waits in `PENDING_ORDER` until valid transactions for sequences 1 through 4 arrive; an invalid record at another account/sequence does not fill that gap.
+Sequence numbering starts independently at 1 for every account. Thus an isolated first transaction for a new account must use sequence 1 to reach processing and exercise retries. A first transaction submitted with sequence 5 waits in `PENDING_ORDER` until valid transactions for sequences 1 through 4 arrive; an invalid record at another account/sequence does not fill that gap. The supplied sample intentionally preserves `TXN-2005` at sequence 5, so its simulated retry is not attempted during the sample run.
 
 ## Retries and failures
 
-Each processing attempt increments `attempts`. `simulateFailureOnce` (or `simulateFailureCount`, a bounded 0-10 test hook) makes the next attempt fail deterministically. Each simulated failure sets `RETRY_PENDING` and changes neither balance nor sequence. A later worker pass may retry it. `app.worker.max-attempts` (default 3) caps attempts; a transaction still failing at the cap is marked `FAILED` and consumes its sequence. The default sample models one transient failure and succeeds on attempt two; the count option exercises the cap. A real downstream integration should classify retryable versus permanent errors and use backoff.
+Each processing attempt increments `attempts`. `simulateFailureOnce` (or `simulateFailureCount`, a bounded 0-10 test hook) makes the next attempt fail deterministically. Each simulated failure sets `RETRY_PENDING` and changes neither balance nor sequence. A later worker pass may retry it. `app.worker.max-attempts` (default 3) caps attempts; a transaction still failing at the cap is marked `FAILED` and consumes its sequence. An isolated sequence-1 transaction can model a transient failure and succeed on attempt two; the count option exercises the cap. The supplied sample's sequence-5 transaction does not reach that hook until its sequence gap is filled. A real downstream integration should classify retryable versus permanent errors and use backoff.
 
 Invalid REST requests are rejected by Bean Validation before business-transaction persistence, and an error response identifies validation failure. The failed submission is retained in the audit table, does not occupy a transaction ID or account sequence, and does not prevent other valid requests from processing. Insufficient funds is a business failure recorded on its accepted transaction as `FAILED`, not an HTTP validation error.
 
@@ -32,17 +32,17 @@ The batch endpoint accepts up to 500 transaction objects per JSON array. It vali
 
 ## Consistency and concurrency
 
-The worker's transaction keeps its database updates atomic. The account row is the source of truth for both balance and next sequence. The in-process worker facade serializes scheduled and manually triggered runs so they cannot apply the same row concurrently. The unique constraint is the last line of defense for concurrent duplicate inserts. This demo assumes a single worker process; concurrent worker instances would need account row locking or optimistic versioning plus safe work claiming. Submission and processing must share the same database for the current consistency guarantee.
+Each worker tick selects at most `app.worker.batch-size` candidate IDs, ordered so new/retry work is considered before sequence-gap rows. Each candidate is reloaded under a pessimistic transaction-row lock and rechecked for an eligible status; its account row is locked before checking the sequence and updating balance/sequence. Transaction and account changes commit together for each item. Competing instances may select the same ID, but only one can hold its transaction lock; after waiting, the other sees the committed status and skips it. The account lock serializes distinct transaction IDs for the same account and prevents concurrent balance/sequence updates. Locks are released on commit or rollback, so a process crash does not leave a durable claim. The unique constraint remains the last line of defense for concurrent duplicate inserts. This assumes all workers share a database with compatible pessimistic-lock semantics. A production database should be load-tested for lock contention and timeout behavior.
 
 ## Observability
 
-`GET /api/processing/summary` reports current transaction status counts and audited duplicate and validation-failure attempts. `uniqueTransactions` counts accepted business transaction records; `total` is unique records + duplicate attempts + invalid submission attempts, so it includes every recorded input attempt. `RECEIVED` is a current lifecycle status, not a cumulative count of records ever submitted. `GET /api/accounts` lists all created accounts with their current balances and next sequence, while `GET /api/transactions/{transactionId}` and `GET /api/accounts/{accountId}` expose individual transaction/account state. `PROCESSING` is a transient state within the atomic worker transaction. Processing and retry events are logged. This is adequate for a local assessment but is not a substitute for production metrics, structured logs, tracing, or alerts.
+`GET /api/processing/summary` reports current transaction status counts and audited duplicate and validation-failure attempts. `uniqueTransactions` counts accepted business transaction records; `total` is unique records + duplicate attempts + invalid submission attempts, so it includes every recorded input attempt. `RECEIVED` is a current lifecycle status, not a cumulative count of records ever submitted. `GET /api/accounts` lists all created accounts with their current balances and next sequence, while `GET /api/transactions/{transactionId}` and `GET /api/accounts/{accountId}` expose individual transaction/account state. `PROCESSING` is a transient state within the atomic worker transaction. Processing and retry events are logged without account IDs. This is adequate for a local assessment but is not a substitute for production metrics, structured logs, tracing, or alerts.
 
 ## Trade-offs and production hardening
 
-A scheduled database poller is simpler than introducing Kafka and meets the assessment's lightweight constraint. Its limitations are polling latency, single-instance assumptions, and the absence of durable retry scheduling beyond status persistence. Production work should include:
+A scheduled database poller is simpler than introducing Kafka and meets the assessment's lightweight constraint. Its limitations are polling latency, database lock contention, and the absence of durable retry scheduling beyond status persistence. Production work should include:
 
-- database migrations, account locking/versioning, multi-worker claiming and lease recovery;
+- database migrations, lock-timeout policy, and load testing for multi-worker contention;
 - retry backoff with jitter, retryable/permanent error classification, and a dead-letter workflow;
 - an immutable ledger and reconciliation rather than relying only on a mutable balance;
 - authentication/authorization, rate limits, request size limits, and production-safe database configuration;
@@ -53,4 +53,4 @@ The H2 console and Hibernate schema auto-update are development conveniences and
 
 ## AI-assisted development
 
-AI assistance was used to scaffold and iteratively review the service, identify acceptance scenarios, and produce tests/documentation. The final implementation should be reviewed and run by its owner, who should be able to explain idempotency, sequence semantics, transaction boundaries, retry behavior, and the production limitations.
+AI assistance was used to translate supplied review feedback into the payload-conflict response, per-record database locking, bounded polling, sample regression tests, and matching runbook updates. The original sample data was retained rather than modified to make its sequence-5 transaction process: under the documented contiguous-per-account rule it correctly stays pending. The project owner remains responsible for running the tests, checking behavior against the assessment brief, and reviewing database-specific lock behavior before any production use.

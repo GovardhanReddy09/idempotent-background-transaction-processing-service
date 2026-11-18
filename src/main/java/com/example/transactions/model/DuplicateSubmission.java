@@ -22,15 +22,19 @@ public class DuplicateSubmission {
     @Column(nullable = false, length = 80)
     private String requestId;
 
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private boolean payloadConflict;
+
     @Column(nullable = false)
     private Instant attemptedAt;
 
     protected DuplicateSubmission() {
     }
 
-    public DuplicateSubmission(String transactionId, String requestId) {
+    public DuplicateSubmission(String transactionId, String requestId, boolean payloadConflict) {
         this.transactionId = transactionId;
         this.requestId = requestId;
+        this.payloadConflict = payloadConflict;
         this.attemptedAt = Instant.now();
     }
 }

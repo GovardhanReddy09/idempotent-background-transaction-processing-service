@@ -13,7 +13,7 @@ $batchResult = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/transactions/ba
     -ContentType "application/json" -Body $batch
 $batchResult | ConvertTo-Json -Depth 8
 
-Write-Host "Running the processor twice (including the simulated retry)"
+Write-Host "Running the processor twice; TXN-2005 remains pending because its account has no sequences 1-4"
 Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" | ConvertTo-Json -Depth 8
 Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/processing/run" | ConvertTo-Json -Depth 8
 

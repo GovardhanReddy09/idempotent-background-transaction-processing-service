@@ -18,7 +18,7 @@ public class BackgroundProcessor {
         processAvailable();
     }
 
-    public synchronized Map<String, Object> processAvailable() {
+    public Map<String, Object> processAvailable() {
         return batchProcessor.processAvailable();
     }
 }
