@@ -7,9 +7,11 @@ A lightweight transaction ingestion and background-processing service for the FD
 1. **Validate and accept** each transaction over REST. Invalid requests return HTTP 400 (single endpoint) or a per-item `FAILED` result (batch); validation failures are recorded in a separate audit table.
 2. **Persist idempotently** using `transactionId` as the business key, backed by a database unique constraint. An identical repeated key returns `DUPLICATE`; reusing it for a different business payload returns HTTP 409 and cannot create another effect.
 3. **Order per account** by contiguous sequence numbers beginning at 1. The worker processes an expected sequence, holds future sequences in `PENDING_ORDER`, and fails stale or conflicting sequences.
-4. **Apply the business effect atomically** with the status change and account sequence advancement in a database transaction. A debit that would make the balance negative fails but consumes its sequence slot.
+4. **Apply the business effect atomically** with the status change and account sequence advancement in a database transaction. A debit that would make the balance negative fails but consumes its sequence slot. Credit/debit arithmetic is provided by registered strategies; the application rejects duplicate or missing strategy registrations at startup.
 5. **Retry transient failures safely.** The demo's `simulateFailureOnce` flag or optional `simulateFailureCount` (0-10) exercises retry paths: a failed attempt applies no balance or sequence change and becomes `RETRY_PENDING`. Attempts are capped by configuration.
 6. **Inspect behavior** through transaction lookup, account balance, processing summaries, logs, and focused integration tests.
+
+The worker's polling delay, attempt cap, and candidate batch size are configurable in `application.properties`. See [DESIGN.md](DESIGN.md#extending-transaction-behavior) for how to add a transaction-effect strategy without duplicating sequencing or balance-safety rules.
 
 ## Run
 
@@ -94,7 +96,7 @@ Invoke-RestMethod -Method Get -Uri "$base/api/accounts"
 Run this in a PowerShell window whose current directory is the project folder. The sample intentionally includes a future sequence before the preceding one, a repeated transaction ID, one invalid negative amount, and a one-time simulated retry.
 
 ```powershell
-Set-Location "$HOME\Downloads\idempotent-transaction-service"
+# Run from the project folder (the directory containing pom.xml).
 $base = 'http://localhost:8081'
 $batch = Get-Content .\sample-transactions.json -Raw
 $batchResult = Invoke-RestMethod -Method Post -Uri "$base/api/transactions/batch" -ContentType 'application/json' -Body $batch

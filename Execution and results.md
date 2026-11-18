@@ -1,13 +1,32 @@
 # Execution and results
 
-This guide is a rehearsal script for explaining and demonstrating the idempotent transaction processor. It shows what to type, what a typical response means, and what happens inside the service. Run commands in **PowerShell**. The project is configured for Java 17+ and this folder includes the runnable JAR.
+This guide is a rehearsal script for explaining and demonstrating the idempotent transaction processor. It shows what to type, what a typical response means, and what happens inside the service. Run commands in **PowerShell**. The project requires Java 17+ and Maven 3.9+.
 
-## 1. Start clean for a predictable demo
+## 1. Build and start from a fresh copy
+
+After cloning the repository or extracting the shared project folder, open PowerShell in that folder and run:
+
+```powershell
+java -version
+mvn -version
+mvn test
+mvn clean package
+```
+
+The test command runs the unit and Spring integration suite. The package command creates the executable `target\idempotent-transaction-service-1.0.0.jar`; the JAR includes the application dependencies. You can run the packaged application without Maven:
+
+```powershell
+java -jar .\target\idempotent-transaction-service-1.0.0.jar
+```
+
+The service listens on port 8080 by default. Keep that terminal open, then use a second PowerShell terminal for the API examples below. Use either `mvn spring-boot:run` or the JAR command to start the service, not both at once.
+
+## 2. Start clean for a predictable demo
 
 Use two PowerShell terminals. In terminal 1, start a new, timestamped H2 database so old demo values do not affect your results:
 
 ```powershell
-Set-Location "$HOME\Downloads\idempotent-transaction-service"
+# Run from the project folder (the directory containing pom.xml).
 $dbName = "interview-demo-$(Get-Date -Format yyyyMMddHHmmss)"
 java -jar .\target\idempotent-transaction-service-1.0.0.jar --server.port=8080 "--spring.datasource.url=jdbc:h2:file:./data/$dbName;DB_CLOSE_ON_EXIT=FALSE"
 ```
@@ -17,14 +36,14 @@ Keep terminal 1 open. Wait until Spring Boot reports that Tomcat started on port
 In terminal 2:
 
 ```powershell
-Set-Location "$HOME\Downloads\idempotent-transaction-service"
+# Run from the project folder (the directory containing pom.xml).
 $base = 'http://localhost:8080'
 Invoke-RestMethod -Method Get -Uri "$base/api/processing/summary"
 ```
 
 On the fresh database, the summary should initially show zero for each status and `total`. Explain that `RECEIVED` is a *current lifecycle status*, not the cumulative number ever submitted.
 
-## 2. Run the fixed six-row batch sample
+## 3. Run the fixed six-row batch sample
 
 The batch demonstrates four unique valid transactions, one duplicate attempt, and one invalid amount. It also submits sequence 2 before sequence 1 on `ACC-201`. `TXN-2005` retains the assessment's sequence number 5 on a new account, so it demonstrates the missing-sequence wait; its simulated retry is configured but does not run.
 
@@ -52,7 +71,7 @@ Each `results` entry corresponds to an input row. New valid rows initially show 
 3. The invalid row was recorded in the failed-submission audit. It did not occupy a transaction ID or account sequence.
 4. The scheduled processor checks for eligible rows every two seconds. You can trigger it explicitly to make the walkthrough immediate.
 
-## 3. Process rows, ordering, and sequence gap
+## 4. Process rows, ordering, and sequence gap
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri "$base/api/processing/run" | ConvertTo-Json -Depth 8
@@ -63,7 +82,7 @@ On the first pass, the worker processes `ACC-201` in sequence order: sequence 1 
 
 The worker response describes that invocation (`evaluatedThisRun`, `processedThisRun`, `retryScheduledThisRun`, `failedThisRun`, and current status counts). These are not a second submission; invoking processing repeatedly does not apply the same credit/debit twice. Each tick reads a bounded set of candidate IDs, then uses transaction-row and account-row locks for concurrent workers sharing the database.
 
-## 4. Check specific transactions, all accounts, and totals
+## 5. Check specific transactions, all accounts, and totals
 
 ```powershell
 Invoke-RestMethod -Method Get -Uri "$base/api/transactions/TXN-2001" | ConvertTo-Json -Depth 8
@@ -131,7 +150,7 @@ The accepted transaction lookup commands return the stored transaction and its c
 
 The `POST /api/processing/run` response reports work performed in that particular call. A typical run may show `processedThisRun: 3` and `evaluatedThisRun: 4` on the first pass, then `processedThisRun: 0` and `evaluatedThisRun: 1` on the next because the sequence-5 row remains pending. If the scheduled worker processes some rows before the manual command, these per-run figures will differ; the final account balances and summary above remain the expected result.
 
-## 5. Demonstrate individual submissions instead
+## 6. Demonstrate individual submissions instead
 
 For a separate walkthrough, use the script that sends records one at a time. It generates unique IDs per execution, submits an out-of-order sequence, repeats a transaction ID, tries an invalid negative amount, simulates a retry, then fetches each accepted transaction and account summary:
 
@@ -149,16 +168,17 @@ For the fixed sample batch, the equivalent script command is:
 
 The batch script reads `sample-transactions.json`, submits all six rows together, runs the processor twice, then prints transaction results, account balances, and the summary. Its IDs are fixed, so use a fresh database for the expected first-run accepted/duplicate counts.
 
-## 6. Explain the core design in the interview
+## 7. Explain the core design in the interview
 
 - **Idempotency:** `transactionId` is the business key. Identical retries are audited as duplicates; a reused key with a different business payload returns HTTP 409 and is marked as a payload conflict.
 - **Ordering:** sequence numbers start at 1 independently per account. A future sequence waits for the missing sequence; it is not applied out of order.
 - **Safe retries:** a simulated transient failure changes no balance or account sequence. A later processing pass can retry it. Attempts are capped by `app.worker.max-attempts` (default 3).
 - **Failure isolation:** invalid batch items become audited `FAILED` attempts without blocking valid rows. They do not occupy transaction IDs or account sequences.
 - **Atomicity:** account balance, next sequence, and transaction status updates are committed together through the database transaction.
+- **Extensibility:** credit and debit balance calculations are separate Spring strategies registered by transaction type. The registry rejects missing or duplicate strategies at startup; sequencing, locking, overdraft checks, and transaction boundaries stay in the shared processor.
 - **Operational visibility:** transaction lookup, account endpoints, worker-run output, logs, and the processing summary show what was accepted and how it was handled.
 - **Trade-offs:** the assessment uses a scheduled database poller and local H2, not Kafka or a production database. Production still needs migrations, lock-timeout/load testing, authentication, retry backoff, and monitoring.
 
-## 7. End the demo
+## 8. End the demo
 
 In terminal 1, stop the service with `Ctrl+C`. The timestamped H2 database remains under `data\` for later inspection. Use a new timestamped name in section 1 for another clean demo; no database deletion is required.
